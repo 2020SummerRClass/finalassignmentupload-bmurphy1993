@@ -1,0 +1,489 @@
+---
+title: "Inpatient Capacity in the U.S. During the 2020 COVID-19 Crisis"
+author: "Brian Murphy"
+date: "8/13/2020"
+output: slidy_presentation
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initialize Libraries
+```{r}
+library(RCurl)
+library(tidyverse)
+library(data.table)
+library(ComplexHeatmap)
+library(scales)
+library(directlabels)
+library(grid)
+library(openintro)
+library(car)
+```
+
+## Background: Data
+
+COVID-19 Estimated Patient Impact and Hospital Capacity by State
+
+### Source:
+
+* U.S. Department of Health and Human Services (HHS) 
+* HHS TeleTracking 
+* Reporting provided directly to HHS Protect by state/territorial health departments on behalf of their healthcare facilities
+* https://healthdata.gov/dataset/covid-19-estimated-patient-impact-and-hospital-capacity-state
+
+### Estimation Method:
+
+* Three metrics of interest
+  + Estimated inpatient beds occupied
+  + Estimated inpatient beds occupied by COVID-19 patients
+  + Estimated ICU beds occupied
+* Data are daily, by state in the U.S. in 2020
+* Reported occupied beds
+  + Percentage of beds occupied for reporting hospitals
+  + Occupied beds / Total beds
+* Total inpatient beds
+  + Calculate weights based on percentage of total beds associated with reporting hospitals
+  + Estimate total inpatient beds by dividing total beds by reporting hospital weight
+* Expected unreported occupied beds = Estimated total inpatient beds - Reported occupied beds
+* Total estimated occupied beds = Reported occupied beds + Expected unreported occupied beds
+
+### Import Inpatient Beds Data
+```{r}
+# Inpatient Occupied
+url <- "https://raw.githubusercontent.com/bmurphy1993/NYU-R-Programming-Final-Project/master/reported_inpatient_all_20200720_0537.csv"
+inpatient <- read.csv(url, header = TRUE, sep = ",", quote = "\"'")
+
+# COVID-19 Inpatient Occupied
+url <- "https://raw.githubusercontent.com/bmurphy1993/NYU-R-Programming-Final-Project/master/inpatient_covid_final_20200720_0537.csv"
+covid <- read.csv(url, header = TRUE, sep = ",", quote = "\"'")
+
+# ICU Occupied
+url <- "https://raw.githubusercontent.com/bmurphy1993/NYU-R-Programming-Final-Project/master/icu_final_20200720_0537.csv"
+icu <- read.csv(url, header = TRUE, sep = ",", quote = "\"'")
+```
+
+***
+
+## Background: Data
+
+### Variables
+
+Estimated inpatient beds occupied
+```{r}
+summary(inpatient)
+```
+
+Estimated inpatient beds occupied by COVID-19 patients
+```{r}
+summary(covid)
+```
+
+Estimated ICU beds occupied
+```{r}
+summary(icu)
+```
+
+***
+
+## Background: Analysis
+
+### Analysis Questions/Potential Insights
+
+* Have U.S. hospitals been pushed beyond normal inpatient and ICU capacity during the COVID-19 crisis?
+  + Hypothesis: Yes for both metrics
+* Whether and to what extent U.S. hospitals have expanded their normal "capacity"
+* Have COVID-19 inpatients contributed significantly to these changes?
+* Do the changes appear to be temporary or will they have lasting effects on hospital capacity?
+
+***
+
+## Methods: Data Cleaning
+
+Rename common variables
+```{r}
+# Rename common variables so that they will remain distinct after merging data
+df_list = list(inpatient = inpatient, covid = covid, icu = icu)
+for(df_name in names(df_list)) {
+  df_list[[df_name]] = df_list[[df_name]] %>%
+    rename_with(.fn = ~paste(., df_name, sep = "."), .cols = c("Count.LL", "Count.UL", "Percentage.LL", "Percentage.UL"))
+}
+```
+Merge the data sets in the list
+```{r}
+# Merge by "state" and "collection_date"
+beds_all <- df_list %>% 
+  reduce(left_join, by = c("state", "collection_date"))
+```
+Reformat the date variable
+```{r}
+# Reformat "collection_date" variable from character to date
+beds_all$collection_date <- as.Date(beds_all$collection_date, "%Y-%m-%d")
+```
+Final cleanup
+```{r}
+# Rename long variable names
+setnames(beds_all, 
+         old = c("Inpatient.Beds.Occupied.Estimated","Percentage.of.Inpatient.Beds.Occupied.Estimated", "Inpatient.Beds.Occupied.by.COVID.19.Patients.Estimated", "Percentage.of.Inpatient.Beds.Occupied.by.COVID.19.Patients.Estimated", "ICU.Beds.Occupied.Estimated", "Percentage.of.ICU.Beds.Occupied.Estimated"), 
+         new = c("inpatient.occupied","inpatient.percent","covid.occupied", "covid.percent","icu.occupied", "icu.percent"))
+
+# Drop the upper and lower limit variables
+beds <- beds_all[,-c(4:5, 7:8, 10:11, 13:14, 16:17, 19:20)]
+
+head(beds)
+```
+***
+
+## Methods: Data Exploration
+Summary info
+```{r}
+summary(beds)
+  # Max inpatient and covid occupancy = 100%
+  # Max ICU capacity = Inf. Replace Inf with NA.
+beds$icu.percent <- na_if(beds$icu.percent, Inf)
+summary(beds$icu.percent)
+```
+***
+
+## Methods: Data Exploration
+
+Deal with missing values
+```{r}
+beds[is.na(beds[6]),]
+  # Captures missing values for inpatient, inpatient.percent, covid, and covid.percent
+  # These are only HI and GU. Only interested in mainland U.S. because it is unlikely that 
+unique(beds$state)
+  # Drop non-mainland states and territories: Alaska (AK), Hawaii (HI), Curacao (CW), Guam (GU), Puerto Rico (PR) 
+beds_main <- beds[ ! beds$state %in% c("AK", "HI", "CW", "GU", "PR"), ]
+unique(beds_main$state) # Now those states and territories are dropped
+
+head(beds_main[is.na(beds_main[7]),])
+beds_main[is.na(beds_main$icu.occupied),] %>% 
+  group_by(state) %>% 
+  summarise(max_date = max(collection_date)) 
+  # For the most part, looks like data  was not tracking ICU numbers earlier in the pandemic for certain states. Leave NAs alone for now.
+```
+***
+
+## Methods: Data Transformations
+
+### New Variables
+
+Calculate max capacity for each metric
+```{r}
+# Use 'transform()' function to calculate capacity = occupied / percent_occupied
+beds_main <- transform(beds_main, inpatient.capacity = inpatient.occupied / inpatient.percent)
+beds_main <- transform(beds_main, covid.capacity = covid.occupied / covid.percent)
+beds_main <- transform(beds_main, icu.capacity = icu.occupied / icu.percent)
+  # COVID capacity should equal inpatient capacity. Sometimes does, sometimes doesn't. Coming back to this.
+
+# The new capacity variables sometimes equal "NaN" because of denominators equal to zero
+  # Change NaNs to missing using 'na_if()' function
+beds_main$inpatient.capacity <- na_if(beds_main$inpatient.capacity, "NaN")
+beds_main$covid.capacity <- na_if(beds_main$covid.capacity, "NaN")
+beds_main$icu.capacity <- na_if(beds_main$icu.capacity, "NaN")
+```
+
+Investigate inpatient capacity further
+```{r}
+# Compare inpatient capacity and COVID-19 capacity. These should be the same in theory.
+beds_main %>% 
+  group_by(state) %>% 
+  summarise(mean_inpat = mean(inpatient.capacity, na.rm = TRUE), mean_cov = mean(covid.capacity, na.rm = TRUE),
+            med_inpat = median(inpatient.capacity, na.rm = TRUE), med_cov = median(covid.capacity, na.rm = TRUE))
+```
+Drop covid.capacity and use inpatient capacity
+```{r}
+beds_main <- beds_main[,-10]
+```
+* In theory, they estimate the same thing
+* covid.capacity has a fair amount of missing values
+* For non-missing values, means and medians are similar
+* Differences are likely due to the fact that all these metrics are estimated
+
+
+
+Can recalculate COVID % of capacity based on inpatient capacity:
+```{r}
+beds_main$covid.percent <- beds_main$covid.occupied / beds_main$inpatient.capacity
+  # This allows for apples-to-apples comparisons of COVID-19 and all inpatient occupancy %s 
+```
+
+***
+
+## Methods: Data Transformations
+
+### Create Transformed Data Cuts for Visualizations
+
+Collapse to Entire U.S.
+```{r}
+# Use this to see nationwide change over time
+beds_main_total <- beds_main %>% 
+  group_by(collection_date) %>% # Summing by date essentially removes the state variable to get daily totals for the entire country
+  summarise(inpatient.occupied = sum(inpatient.occupied, na.rm = TRUE), 
+            covid.occupied = sum(covid.occupied, na.rm = TRUE), 
+            icu.occupied = sum(icu.occupied, na.rm = TRUE), 
+            inpatient.capacity = sum(inpatient.capacity, na.rm = TRUE), 
+            icu.capacity = sum(icu.capacity, na.rm = TRUE))
+```
+***
+
+## Methods: Data Transformations
+
+### Create Transformed Data Cuts for Visualizations
+
+Matrices for heatmaps: States as columns, days as rows
+```{r}
+# Inpatient Percent of Capacity
+inpat.percent <- spread(beds_main[,c(1:2,4)],state,inpatient.percent) # spread() function reshapes data
+inpat.percent.mat <- as.matrix(inpat.percent[,2:50]) # turn into matrix for heatmap
+rnames <- as.character(inpat.percent[,1]) # Use dates as row names in matrix
+rownames(inpat.percent.mat) <- rnames
+
+tail(inpat.percent.mat) # Used 'tail()' rather than 'head()' because many early values are missing
+
+# COVID Percent of Capacity
+cov.percent <- spread(beds_main[,c(1:2,6)],state,covid.percent)
+cov.percent.mat <- as.matrix(cov.percent[,2:50])
+rnames <- as.character(cov.percent[,1])
+rownames(cov.percent.mat) <- rnames
+
+# ICU Percent of Capacity
+ICU.percent <- spread(beds_main[,c(1:2,8)],state,icu.percent)
+ICU.percent.mat <- as.matrix(ICU.percent[,2:50])
+rnames <- as.character(ICU.percent[,1])
+rownames(ICU.percent.mat) <- rnames
+```
+
+***
+
+## Results: Visualizations
+
+### Plot the variables in question for the entire U.S.
+```{r}
+# Add one more variable to show the total inpatients not including COVID-19
+beds_main_total <- transform(beds_main_total, inpatient.non_covid = inpatient.occupied - covid.occupied)
+# Reshape data using 'melt()' function to use for a ggplot2 graph
+beds_main_total_melt <- reshape2::melt(beds_main_total, id.var='collection_date')
+
+# Create line plot to show development over the course of the year
+lp <- ggplot(beds_main_total_melt, aes(x = collection_date, y = value, col = variable)) + # Uses "melted" data to plot all variables at once
+  geom_line(size = 1, aes(linetype = variable)) + 
+  scale_linetype_manual(values=c("solid", "solid", "solid", "dashed", "dashed", "solid")) + # Make capacities dashed
+  labs(title = "U.S. Hospital Bed Occupancy in 2020", x = "Date in 2020", y = "Total Beds") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none", plot.margin = unit(c(1,6,1,1), "lines")) +
+  # Add axis and series labels
+  scale_y_continuous(labels = number) +
+  geom_text(data = subset(beds_main_total_melt, collection_date == 18457), aes(label = variable), hjust = -.1) +
+  scale_colour_discrete(guide = 'none') +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month")
+
+# Allow series labels to hang off the chart
+gt <- ggplotGrob(lp)
+gt$layout$clip[gt$layout$name == "panel"] <- "off"
+grid.draw(gt)
+```
+
+***
+
+## Results: Visualizations
+
+### Heatmaps: Hospital Bed Occupancy by State
+
+Could use line plots, but they get crowded with 50 series. Heatmaps help with this and can still show change over time
+```{r}
+# Inpatient Percent of Capacity
+Heatmap(inpat.percent.mat, 
+        row_title = "Date Ascdending from Top", 
+        column_title = "Inpatient Percent of Total Beds by State in 2020",
+        cluster_rows = FALSE, # Want rows to remain sorted by date
+        show_row_names = FALSE,
+        show_column_dend = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "")
+        )
+
+# COVID Percent of Capacity
+Heatmap(cov.percent.mat, 
+        row_title = "Date Ascdending from Top", 
+        column_title = "COVID-19 Percent of Total Beds by State in 2020",
+        cluster_rows = FALSE,
+        show_row_names = FALSE,
+        show_column_dend = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "")
+        )
+
+# ICU Percent of Capacity
+Heatmap(ICU.percent.mat, 
+        row_title = "Date Ascdending from Top", 
+        column_title = "Percent of Total ICU Beds by State in 2020",
+        cluster_rows = FALSE,
+        show_row_names = FALSE,
+        show_column_dend = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "")
+        )
+
+# Column clustering allows us to approximate which states have been pushed closest to capacity
+# Maps also show the initial "wave" of cases in some states. Reflects that states were initially pushed to their limits but then expanded capacity
+# Interestingly, the states with the highest overall occupancy % did not necessarily have highest ICU occupancy
+```
+
+***
+
+## Results: Visualizations
+
+### Heatmaps with pre-COVID-19 Hospital Capacities
+
+Redefine Inpatient capacity and ICU capacity to their initial values
+```{r}
+# Inpatient original cap
+  # Using 'which()' and 'ave()' functions, find the inpatient capacity for each state at the earliest date available 
+  # in the data to estimate what capacity would have been before the invlux of COVID-19 cases  
+beds_main_inpat_nona <- beds_main[!is.na(beds_main$inpatient.capacity),]
+original_cap <- beds_main_inpat_nona[
+  which(beds_main_inpat_nona$collection_date == 
+          ave(beds_main_inpat_nona$collection_date, beds_main_inpat_nona$state, FUN = min)), c(1, 9)]
+
+# ICU original cap
+beds_main_icu_nona <- beds_main[!is.na(beds_main$icu.capacity),]
+original_cap_icu <- beds_main_icu_nona[
+  which(beds_main_icu_nona$collection_date == 
+          ave(beds_main_icu_nona$collection_date, beds_main_icu_nona$state, FUN = min)), c(1, 10)] 
+
+# Merge the inpatient and ICU initial capacities with 'left_join()' funciton
+original_cap <- left_join(original_cap, original_cap_icu, by = "state")
+
+original_cap <- rename(original_cap, "inpat.cap.orig" = inpatient.capacity)
+original_cap <- rename(original_cap, "icu.cap.orig" = icu.capacity)
+
+# Merge back onto main dataset 
+beds_main_origcap <- left_join(beds_main, original_cap, by = "state") 
+beds_main_origcap$icu.cap.orig <- ifelse(beds_main_origcap$icu.occupied == 0, NA, beds_main_origcap$icu.cap.orig)
+
+# Redefine %s as portion of initial capacities rather than the dynamic capacities
+beds_main_origcap$inpatient.percent <- beds_main_origcap$inpatient.occupied / beds_main_origcap$inpat.cap.orig
+beds_main_origcap$covid.percent <- beds_main_origcap$covid.occupied / beds_main_origcap$inpat.cap.orig
+beds_main_origcap$icu.percent <- beds_main_origcap$icu.occupied / beds_main_origcap$icu.cap.orig
+``` 
+
+Now remake Heatmap matrices
+```{r}
+# Inpatient Percent of Capacity
+inpat.percent.orig <- spread(beds_main_origcap[,c(1:2,4)],state,inpatient.percent)
+inpat.percent.orig.mat <- as.matrix(inpat.percent.orig[,2:50])
+rnames <- as.character(inpat.percent.orig[,1])
+rownames(inpat.percent.orig.mat) <- rnames
+
+# COVID Percent of Capacity
+cov.percent.orig <- spread(beds_main_origcap[,c(1:2,6)],state,covid.percent)
+cov.percent.orig.mat <- as.matrix(cov.percent.orig[,2:50])
+rnames <- as.character(cov.percent.orig[,1])
+rownames(cov.percent.orig.mat) <- rnames
+
+# ICU Percent of Capacity
+ICU.percent.orig <- spread(beds_main_origcap[,c(1:2,8)],state,icu.percent)
+ICU.percent.orig.mat <- as.matrix(ICU.percent.orig[,2:50])
+rnames <- as.character(ICU.percent.orig[,1])
+rownames(ICU.percent.orig.mat) <- rnames
+```
+
+And remake Heatmaps
+```{r}
+# Inpatient Percent of Capacity
+Heatmap(inpat.percent.orig.mat[,-c(5,19)], # Remove outliers Colorado and Maryland
+        row_title = "Date Ascdending from Top", 
+        column_title = "Inpatient Percent of Total Beds by State in 2020 \nInitially Reported Inpatient Capacity",
+        cluster_rows = FALSE,
+        show_row_names = FALSE,
+        show_column_dend = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "")
+        )
+
+# COVID Percent of Capacity
+Heatmap(cov.percent.orig.mat[,-c(5,19)], # Remove outliers Colorado and Maryland
+        row_title = "Date Ascdending from Top", 
+        column_title = "COVID-19 Percent of Total Beds by State in 2020 \nInitially Reported Inpatient Capacity",
+        cluster_rows = FALSE,
+        show_row_names = FALSE,
+        show_column_dend = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "")
+        )
+
+# ICU Percent of Capacity
+Heatmap(ICU.percent.orig.mat[,-c(10,42)], # Remove outliers Georgia and Texas
+        row_title = "Date Ascdending from Top", 
+        column_title = "Percent of Total ICU Beds by State in 2020 \nInitially Reported ICU Capacity",
+        cluster_rows = FALSE,
+        show_row_names = FALSE,
+        show_column_dend = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "")
+        )
+
+# Scale drastically increased
+# Shows which states had to expand their capacity by the most
+```
+
+***
+
+## Results: Regressions
+
+```{r}
+icureg <- lm(icu.occupied ~ covid.occupied + inpatient.occupied + collection_date, data = beds_main, na.action = na.omit)
+summary(icureg)
+  # About 10 additional COVID-19 patients predicts one additional ICU patient
+  # About 7 for all inpatient
+  # Regression F-stat and p-value indicate that the model has predictive power
+  # R^2 is > 90%. 
+  # Coefficient p-values indicate high levels of significance
+
+# Test for collinearity
+vif(icureg)
+```
+
+***
+
+## Discussion/Takeaways
+
+* Inpatient capacity increased drastically at the state- and country-level
+  + Far exceeded needs based on increased inpatients at country-level
+  + Some states still at or near 100% capacity
+* Large increase in inpatients only partially explained by COVID-19 patients
+* ICU capacity also increased significantly
+  + Occupancy was near capacity pre-COVID-19
+  + Increased with COVID, but was more than offset by increased capacity 
+* Regression results:
+  + Increased COVID-19 inpatients predicts increased ICU occupancy
+  + However, to lesser extent than increase in overall inpatients
+* States with highest overall inpatient occupancy did not necessarily struggle equally with ICU capacity 
+
+***
+
+## Future Directions
+
+* Continue monitoring capacities to see if they revert to pre-COVID-19 levels
+* Investigate increase in non-COVID-19 inpatients. 
+  + What were their diagnoses?
+  + Was this a reporting issue?
+  + If not, how is the increase connected to COVID-19 patients?
+* Explore state-level analysis for states most affected by COVID-19
+  + Introduce reported COVID-19 cases (not just hospitalizations)
+  + Introduce demographic info about states
+
+***
+
+## References
+
+U.S. Department of Health & Human Services, "COVID-19 Estimated Patient Impact and Hospital Capacity by State," HealthData.gov, https://healthdata.gov/dataset/covid-19-estimated-patient-impact-and-hospital-capacity-state
+
+Original data links:
+
+* Inpatient: https://healthdata.gov/sites/default/files/reported_inpatient_all_20200720_0537.csv
+* COVID: https://healthdata.gov/sites/default/files/inpatient_covid_final_20200720_0537.csv
+* ICU: https://healthdata.gov/sites/default/files/icu_final_20200720_0537.csv
+
